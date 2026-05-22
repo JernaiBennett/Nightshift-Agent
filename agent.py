@@ -225,7 +225,7 @@ def fetch_job_from_url(url: str) -> Optional[dict]:
             output_config={
                 "format": {
                     "type": "json_schema",
-                    "json_schema": {"name": "job_extraction", "schema": JOB_EXTRACTION_SCHEMA},
+                    "schema": JOB_EXTRACTION_SCHEMA,
                 }
             },
         )
@@ -274,10 +274,7 @@ def analyze_job_with_claude(job_description: str, resume: dict) -> dict:
             output_config={
                 "format": {
                     "type": "json_schema",
-                    "json_schema": {
-                        "name": "job_analysis",
-                        "schema": ANALYSIS_SCHEMA,
-                    },
+                    "schema": ANALYSIS_SCHEMA,
                 }
             },
         )
@@ -375,10 +372,7 @@ def parse_resume_file(file_path: Path) -> dict:
             output_config={
                 "format": {
                     "type": "json_schema",
-                    "json_schema": {
-                        "name": "resume_profile",
-                        "schema": RESUME_EXTRACTION_SCHEMA,
-                    },
+                    "schema": RESUME_EXTRACTION_SCHEMA,
                 }
             },
         )
