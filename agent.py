@@ -2,12 +2,16 @@
 """Job Intelligence Agent — resume gap analysis, course recommendations, application tracking."""
 
 import base64
+import html as html_lib
 import json
 import os
+import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+import requests
 
 import anthropic
 import typer
@@ -140,6 +144,17 @@ ANALYSIS_SCHEMA = {
     "additionalProperties": False
 }
 
+JOB_EXTRACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "company": {"type": "string"},
+        "title": {"type": "string"},
+        "description": {"type": "string"},
+    },
+    "required": ["company", "title", "description"],
+    "additionalProperties": False,
+}
+
 STATUS_COLORS = {
     "saved": "cyan",
     "applied": "blue",
@@ -174,6 +189,49 @@ def get_db() -> sqlite3.Connection:
     """)
     conn.commit()
     return conn
+
+
+def _strip_html(raw: str) -> str:
+    raw = re.sub(r"<(script|style)[^>]*>.*?</(script|style)>", "", raw, flags=re.DOTALL | re.IGNORECASE)
+    raw = re.sub(r"<[^>]+>", " ", raw)
+    raw = html_lib.unescape(raw)
+    return re.sub(r"\s+", " ", raw).strip()
+
+
+def fetch_job_from_url(url: str) -> Optional[dict]:
+    """Fetch a job posting URL and use Claude to extract company, title, and description."""
+    try:
+        resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+    except Exception as exc:
+        console.print(f"[red]Could not fetch URL: {exc}[/red]")
+        return None
+
+    page_text = _strip_html(resp.text)[:12000]  # cap to avoid excess tokens
+
+    client = anthropic.Anthropic()
+    with console.status("[bold blue]Extracting job details from page...[/bold blue]"):
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=2048,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Extract the job posting details from this page text. "
+                    "Return the full job description as-is (do not summarize).\n\n"
+                    f"---\n{page_text}\n---"
+                ),
+            }],
+            output_config={
+                "format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "job_extraction", "schema": JOB_EXTRACTION_SCHEMA},
+                }
+            },
+        )
+
+    text = next(b.text for b in response.content if b.type == "text")
+    return json.loads(text)
 
 
 def load_resume() -> dict:
@@ -369,19 +427,48 @@ def setup_resume(
 
 @app.command("add-job")
 def add_job(
-    company: str = typer.Option(..., prompt=True),
-    title: str = typer.Option(..., prompt=True),
-    url: str = typer.Option("", prompt="Job URL (optional)"),
+    url: Optional[str] = typer.Argument(None, help="Job posting URL — auto-extracts details"),
 ):
-    """Add a new job and paste the description (end with a line containing only '---')."""
-    console.print("\nPaste the job description below. End with a line containing only [bold]---[/bold]:")
-    lines = []
-    while True:
-        line = input()
-        if line.strip() == "---":
-            break
-        lines.append(line)
-    description = "\n".join(lines).strip()
+    """Add a job from a URL (auto-extracts title + description) or enter manually."""
+    company, title, description = "", "", ""
+
+    if url:
+        extracted = fetch_job_from_url(url)
+        if extracted:
+            company = extracted["company"]
+            title = extracted["title"]
+            description = extracted["description"]
+
+            console.print(Panel(
+                f"[bold]Company:[/bold] {company}\n"
+                f"[bold]Title:[/bold]   {title}\n"
+                f"[bold]Preview:[/bold] {description[:200]}{'...' if len(description) > 200 else ''}",
+                title="[bold green]Extracted from URL[/bold green]",
+                border_style="green",
+            ))
+
+            override = typer.confirm("Looks good?", default=True)
+            if not override:
+                company = typer.prompt("Company", default=company)
+                title = typer.prompt("Job title", default=title)
+        else:
+            console.print("[yellow]Falling back to manual entry.[/yellow]")
+
+    if not description:
+        if not company:
+            company = typer.prompt("Company")
+        if not title:
+            title = typer.prompt("Job title")
+        if not url:
+            url = typer.prompt("Job URL (optional)", default="")
+        console.print("\nPaste the job description. Press [bold]Enter on a blank line[/bold] when done:")
+        lines = []
+        while True:
+            line = input()
+            if not line.strip():
+                break
+            lines.append(line)
+        description = "\n".join(lines).strip()
 
     if not description:
         console.print("[red]No description provided.[/red]")
