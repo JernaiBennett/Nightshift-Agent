@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Job Intelligence Agent — resume gap analysis, course recommendations, application tracking."""
 
+import base64
 import json
 import os
 import sqlite3
@@ -22,6 +23,33 @@ MODEL = "claude-sonnet-4-6"
 DATA_DIR = Path.home() / ".nightshift"
 RESUME_FILE = DATA_DIR / "resume.json"
 DB_FILE = DATA_DIR / "jobs.db"
+
+RESUME_EXTRACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "current_title": {"type": "string"},
+        "years_experience": {"type": "string"},
+        "summary": {"type": "string"},
+        "technical_skills": {"type": "array", "items": {"type": "string"}},
+        "languages": {"type": "array", "items": {"type": "string"}},
+        "frameworks": {"type": "array", "items": {"type": "string"}},
+        "tools": {"type": "array", "items": {"type": "string"}},
+        "cloud_platforms": {"type": "array", "items": {"type": "string"}},
+        "soft_skills": {"type": "array", "items": {"type": "string"}},
+        "education": {"type": "array", "items": {"type": "string"}},
+        "certifications": {"type": "array", "items": {"type": "string"}},
+        "notable_projects": {"type": "array", "items": {"type": "string"}},
+        "preferred_roles": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": [
+        "name", "current_title", "years_experience", "summary",
+        "technical_skills", "languages", "frameworks", "tools",
+        "cloud_platforms", "soft_skills", "education", "certifications",
+        "notable_projects", "preferred_roles",
+    ],
+    "additionalProperties": False,
+}
 
 SYSTEM_INSTRUCTIONS = """\
 You are an expert career intelligence analyst and skills advisor. Your role is to:
@@ -257,56 +285,86 @@ def print_analysis(analysis: dict, company: str, title: str) -> None:
     console.print(Panel(analysis["application_advice"], border_style="dim"))
 
 
+def parse_resume_file(file_path: Path) -> dict:
+    """Send a resume file to Claude and extract structured profile data."""
+    client = anthropic.Anthropic()
+    suffix = file_path.suffix.lower()
+
+    if suffix == ".pdf":
+        raw = base64.standard_b64encode(file_path.read_bytes()).decode("utf-8")
+        content = [
+            {
+                "type": "document",
+                "source": {"type": "base64", "media_type": "application/pdf", "data": raw},
+            },
+            {
+                "type": "text",
+                "text": "Extract all information from this resume and return it as structured JSON matching the schema exactly.",
+            },
+        ]
+    else:
+        text = file_path.read_text(errors="replace")
+        content = (
+            f"Extract all information from this resume and return it as structured JSON "
+            f"matching the schema exactly.\n\n---\n{text}\n---"
+        )
+
+    with console.status("[bold blue]Reading resume with Claude...[/bold blue]"):
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=2048,
+            messages=[{"role": "user", "content": content}],
+            output_config={
+                "format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "resume_profile",
+                        "schema": RESUME_EXTRACTION_SCHEMA,
+                    },
+                }
+            },
+        )
+
+    text_block = next(b.text for b in response.content if b.type == "text")
+    return json.loads(text_block)
+
+
 @app.command("setup-resume")
-def setup_resume():
-    """Interactively build or update your resume/skills profile."""
+def setup_resume(
+    file: Optional[Path] = typer.Argument(None, help="Path to your resume file (PDF or TXT)"),
+):
+    """Load your resume from a file — PDF or plain text."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    existing = {}
-    if RESUME_FILE.exists():
-        existing = json.loads(RESUME_FILE.read_text())
-        console.print("[yellow]Existing resume found. Press Enter to keep current values.[/yellow]\n")
+    if file is None:
+        console.print("[red]Please provide your resume file:[/red]")
+        console.print("  python agent.py setup-resume /path/to/resume.pdf")
+        console.print("  python agent.py setup-resume /path/to/resume.txt")
+        raise typer.Exit(1)
 
-    def prompt(field: str, default: str = "") -> str:
-        current = existing.get(field, default)
-        hint = f" [dim](current: {current})[/dim]" if current else ""
-        val = typer.prompt(f"{field}{hint}", default=current)
-        return val
+    if not file.exists():
+        console.print(f"[red]File not found: {file}[/red]")
+        raise typer.Exit(1)
 
-    resume = {
-        "name": prompt("name"),
-        "current_title": prompt("current_title"),
-        "years_experience": prompt("years_experience"),
-        "summary": prompt("summary"),
-    }
+    suffix = file.suffix.lower()
+    if suffix not in {".pdf", ".txt", ".md"}:
+        console.print("[red]Supported formats: .pdf, .txt, .md[/red]")
+        raise typer.Exit(1)
 
-    console.print("\n[bold]Skills[/bold] (comma-separated):")
-    for category in ["technical_skills", "languages", "frameworks", "tools", "cloud_platforms", "soft_skills"]:
-        current = ", ".join(existing.get(category, []))
-        raw = typer.prompt(f"  {category}", default=current)
-        resume[category] = [s.strip() for s in raw.split(",") if s.strip()]
-
-    console.print("\n[bold]Education[/bold] (e.g. 'BS Computer Science, State University, 2020'):")
-    current_edu = "\n".join(existing.get("education", []))
-    raw_edu = typer.prompt("  education entries (one per line, use \\n)", default=current_edu)
-    resume["education"] = [e.strip() for e in raw_edu.split(r"\n") if e.strip()]
-
-    console.print("\n[bold]Certifications[/bold] (comma-separated):")
-    current_certs = ", ".join(existing.get("certifications", []))
-    raw_certs = typer.prompt("  certifications", default=current_certs)
-    resume["certifications"] = [c.strip() for c in raw_certs.split(",") if c.strip()]
-
-    console.print("\n[bold]Recent Projects / Achievements[/bold] (comma-separated, brief descriptions):")
-    current_proj = ", ".join(existing.get("notable_projects", []))
-    raw_proj = typer.prompt("  notable_projects", default=current_proj)
-    resume["notable_projects"] = [p.strip() for p in raw_proj.split(",") if p.strip()]
-
-    resume["preferred_roles"] = [r.strip() for r in typer.prompt(
-        "\nPreferred role types (comma-separated)", default=", ".join(existing.get("preferred_roles", []))
-    ).split(",") if r.strip()]
+    resume = parse_resume_file(file)
 
     RESUME_FILE.write_text(json.dumps(resume, indent=2))
-    console.print(f"\n[green]Resume saved to {RESUME_FILE}[/green]")
+
+    console.print(Panel(
+        f"[bold]{resume.get('name', 'Unknown')}[/bold] — {resume.get('current_title', '')}\n"
+        f"Experience: {resume.get('years_experience', '')}\n"
+        f"Skills found: {len(resume.get('technical_skills', []) + resume.get('languages', []) + resume.get('frameworks', []))} technical, "
+        f"{len(resume.get('certifications', []))} certifications\n"
+        f"Education: {len(resume.get('education', []))} entries",
+        title="[bold green]Resume Parsed[/bold green]",
+        border_style="green",
+    ))
+    console.print(f"[green]Profile saved to {RESUME_FILE}[/green]")
 
 
 @app.command("add-job")
